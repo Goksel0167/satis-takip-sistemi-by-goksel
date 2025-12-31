@@ -85,7 +85,11 @@ def normalize_dataframe(df):
     ]
     for c in numeric_cols:
         df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
-        
+    
+    # TARİH DÜZELTME (HATA BURADA ÇÖZÜLÜYOR)
+    if COLS['tarih'] in df.columns:
+        df[COLS['tarih']] = pd.to_datetime(df[COLS['tarih']], errors='coerce')
+
     return df
 
 def load_data():
@@ -102,9 +106,6 @@ def load_data():
             try:
                 df_temp = pd.read_csv(SALES_FILE)
                 st.session_state.df = normalize_dataframe(df_temp)
-                # Tarih düzeltme
-                if COLS['tarih'] in st.session_state.df.columns:
-                    st.session_state.df[COLS['tarih']] = pd.to_datetime(st.session_state.df[COLS['tarih']], errors='coerce')
             except:
                 st.session_state.df = pd.DataFrame(columns=COLS.values())
         else:
@@ -221,8 +222,12 @@ with tab1:
                 tutar_usd = fark * tonaj
                 tutar_tl = tutar_usd * kur_input
                 
+                # --- TARİH FORMATI DÜZELTME (BURASI DEĞİŞTİ) ---
+                # secilen_tarih 'date' objesiydi, bunu pandas'ın anlayacağı 'timestamp' formatına çeviriyoruz.
+                tarih_ts = pd.to_datetime(secilen_tarih)
+                
                 new_data = {
-                    COLS['tarih']: secilen_tarih,
+                    COLS['tarih']: tarih_ts,
                     COLS['gun']: get_day_name(secilen_tarih),
                     COLS['ay']: secilen_tarih.strftime("%Y-%m"),
                     COLS['bayi']: bayi, COLS['mus']: musteri, COLS['fab']: fabrika,
@@ -252,9 +257,13 @@ with tab1:
         m2.metric("TOPLAM Tutar ($)", f"${t_usd:,.2f}")
         m3.metric("TOPLAM Tutar (TL)", f"₺{t_tl:,.2f}")
         
-        # --- DÜZELTME BURADA YAPILDI (ascending=True) ---
-        # Eski tarih (1. ay) en üstte, yeni tarih (12. ay) en altta.
+        # --- SIRALAMA HATASI İÇİN GÜVENLİK ÖNLEMİ ---
+        # Sıralama yapmadan önce Tarih sütununu kesinlikle datetime formatına zorluyoruz.
+        st.session_state.df[COLS['tarih']] = pd.to_datetime(st.session_state.df[COLS['tarih']], errors='coerce')
+        
+        # Eskiden Yeniye (ascending=True)
         df_sorted = st.session_state.df.sort_values(by=COLS['tarih'], ascending=True)
+        
         edited_df = st.data_editor(df_sorted, num_rows="dynamic", use_container_width=True)
         
         if st.button("🔄 Tabloyu Güncelle ve Hesapla"):
