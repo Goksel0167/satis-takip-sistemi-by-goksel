@@ -252,7 +252,9 @@ with tab1:
         m2.metric("TOPLAM Tutar ($)", f"${t_usd:,.2f}")
         m3.metric("TOPLAM Tutar (TL)", f"₺{t_tl:,.2f}")
         
-        df_sorted = st.session_state.df.sort_values(by=COLS['tarih'], ascending=False)
+        # --- DÜZELTME BURADA YAPILDI (ascending=True) ---
+        # Eski tarih (1. ay) en üstte, yeni tarih (12. ay) en altta.
+        df_sorted = st.session_state.df.sort_values(by=COLS['tarih'], ascending=True)
         edited_df = st.data_editor(df_sorted, num_rows="dynamic", use_container_width=True)
         
         if st.button("🔄 Tabloyu Güncelle ve Hesapla"):
