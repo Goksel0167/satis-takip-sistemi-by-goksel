@@ -65,24 +65,25 @@ COLS = {
 def get_tcmb_rate(target_date):
     """
     TCMB'den USD Döviz Satış (ForexSelling) kurunu çeker.
-    Hafta sonu ve resmi tatilleri (verinin olmadığı günleri) atlayarak
-    en son geçerli iş gününün kurunu getirir.
+    Eğer tarih tatilse veya veri yoksa, veri bulana kadar geriye doğru gider.
     """
     date_temp = target_date
     
-    # En fazla 10 gün geriye git (Sonsuz döngü koruması)
-    for _ in range(10):
-        # 1. Hafta sonu kontrolü (Cumartesi-Pazar ise Cuma'ya git)
+    # 15 gün geriye gitme limiti (Uzun bayram tatillerini kapsar)
+    for _ in range(15):
+        # 1. Hafta sonu kontrolü (Cumartesi/Pazar ise bir gün geri git)
+        # Bu döngü, hafta içine (Cuma'ya) gelene kadar tarihi geri sarar.
         while date_temp.weekday() >= 5:
             date_temp -= timedelta(days=1)
         
-        # URL Oluşturma
+        # 2. TCMB URL Yapısı: https://www.tcmb.gov.tr/kurlar/202501/01012025.xml
         day = date_temp.strftime("%d")
         month = date_temp.strftime("%m")
         year = date_temp.strftime("%Y")
         url = f"https://www.tcmb.gov.tr/kurlar/{year}{month}/{day}{month}{year}.xml"
         
         try:
+            # İstek gönder (3 saniye zaman aşımı)
             res = requests.get(url, timeout=3)
             
             # Eğer sayfa varsa (200 OK)
@@ -93,17 +94,24 @@ def get_tcmb_rate(target_date):
                     if currency.get('Kod') == 'USD':
                         # FOREX SELLING (Döviz Satış) Verisini Al
                         val_str = currency.find('ForexSelling').text
+                        
+                        # Bazen ForexSelling boş olabilir, BanknoteSelling deneyelim
+                        if not val_str or val_str.strip() == "":
+                             val_str = currency.find('BanknoteSelling').text
+                             
                         if val_str:
                             return float(val_str)
-                return None # USD bulunamazsa
-            else:
-                # Sayfa yoksa (404 vb.) -> Muhtemelen resmi tatil -> 1 gün geri git
-                date_temp -= timedelta(days=1)
-        except Exception as e:
+                # USD bulundu ama değeri boşsa döngüye devam et
+            
+            # Sayfa yoksa (404 - Resmi Tatil) -> Bir gün geri git ve tekrar dene
+            date_temp -= timedelta(days=1)
+            
+        except Exception:
             # Bağlantı hatası vs. olursa da geri gitmeyi dene
             date_temp -= timedelta(days=1)
             
-    return 0.0 # 10 gün boyunca bulamazsa 0 dön
+    # Hiçbir şey bulunamazsa 0.0 döndür
+    return 0.0
 
 # --- DİĞER YARDIMCI FONKSİYONLAR ---
 def load_system_data():
@@ -155,7 +163,6 @@ def akilli_excel_import_definitions(uploaded_file):
 def import_sales_data(uploaded_file):
     try:
         df_new = pd.read_excel(uploaded_file)
-        
         if COLS['tarih'] in df_new.columns:
             df_new[COLS['tarih']] = pd.to_datetime(df_new[COLS['tarih']], errors='coerce')
             df_new[COLS['gun']] = df_new[COLS['tarih']].apply(get_turkish_day)
@@ -248,10 +255,14 @@ tabs = st.tabs(["📝 Satış Girişi & Düzenleme", "📈 Analiz Raporu", "🛠
 with tabs[0]:
     st.markdown("### 1. Yeni Satış Ekle")
     
+    # Form: clear_on_submit=True
     with st.form("entry_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         with c1:
+            # Tarih değiştiğinde sayfa yenilenmediği için kuru burada anlık çekmek zordur.
+            # Ancak butona basıldığında tarih neyse onun kuru çekilecektir.
             tarih = st.date_input("Tarih (Gün/Ay/Yıl)", datetime.now(), format="DD/MM/YYYY")
+            
             bayi = st.selectbox("Bayi/Müşteri Adı", options=sys_data.get("bayiler", []), index=None, placeholder="Seçiniz...")
             musteri = st.selectbox("Müşteri Adı (Proje)", options=sys_data["musteriler"], index=None, placeholder="Seçiniz...")
             fabrika = st.selectbox("Fabrika", options=sys_data["fabrikalar"], index=None, placeholder="Seçiniz...")
@@ -262,13 +273,11 @@ with tabs[0]:
         with c3:
             tonaj = st.number_input("Tonaj KG", min_value=0.0, format="%.2f")
             
-            # --- KUR HESAPLAMA KISMI ---
-            # Eğer tarih bugünse ve kur 0 geldiyse (ya da butonla tetiklendiyse) diye cache kullanıyoruz.
-            kur_default = get_tcmb_rate(tarih) 
-            # Eğer o gün için kur yoksa 0.0 gelir, kullanıcı elle girsin
-            if kur_default is None: kur_default = 0.0
-            
-            kur_inp = st.number_input("TCMB Satış Kuru", value=kur_default, min_value=0.0, format="%.4f")
+            # Kuru otomatik hesaplamak için placeholder koyuyoruz, ancak form içinde dinamik update olmaz.
+            # Kullanıcıya bilgi veriyoruz. Kaydederken otomatik çekeceğiz.
+            st.caption("ℹ️ TCMB Kuru 'Kaydet'e basınca o gün için otomatik çekilir.")
+            # Manuel müdahale istenirse diye alan bırakıyoruz ama varsayılanı 0
+            kur_inp = st.number_input("Manuel Kur (Opsiyonel, 0 bırakırsanız otomatik çeker)", value=0.0, min_value=0.0, format="%.4f")
             
         btn_add = st.form_submit_button("💾 Kaydet")
         
@@ -278,9 +287,16 @@ with tabs[0]:
             else:
                 ay_yil = tarih.strftime("%Y-%m")
                 gun_str = get_turkish_day(tarih)
+                
+                # KUR MANTIĞI: Eğer kullanıcı 0 girdiyse otomatik çek, elle girdiyse onu kullan.
+                final_kur = kur_inp
+                if final_kur == 0.0:
+                    fetched_rate = get_tcmb_rate(tarih)
+                    final_kur = fetched_rate if fetched_rate else 0.0
+                
                 fark_usd = mevcut_fiyat - ind_fiyat
                 tutar_usd = fark_usd * tonaj
-                tutar_tl = tutar_usd * kur_inp
+                tutar_tl = tutar_usd * final_kur
                 
                 new_row = {
                     COLS['tarih']: pd.to_datetime(tarih),
@@ -295,13 +311,17 @@ with tabs[0]:
                     COLS['fark_usd']: fark_usd, 
                     COLS['tonaj']: tonaj,
                     COLS['tutar_usd']: tutar_usd, 
-                    COLS['kur']: kur_inp, 
+                    COLS['kur']: final_kur, 
                     COLS['tutar_tl']: tutar_tl
                 }
                 
                 st.session_state.df_sales = pd.concat([st.session_state.df_sales, pd.DataFrame([new_row])], ignore_index=True)
                 st.session_state.df_sales.to_csv(SALES_FILE, index=False, encoding='utf-8-sig')
-                st.success(f"✅ Kayıt Başarılı! Kur: {kur_inp}")
+                
+                if final_kur == 0.0:
+                    st.warning(f"⚠️ {tarih.strftime('%d.%m.%Y')} için TCMB kuru bulunamadı! Manuel düzenleyebilirsiniz.")
+                else:
+                    st.success(f"✅ Kayıt Başarılı! (Kur: {final_kur})")
                 st.rerun()
 
     st.divider()
@@ -343,6 +363,7 @@ with tabs[0]:
                 COLS['indirimli_usd']: st.column_config.NumberColumn("İndirimli ($)", format="%.2f"),
                 COLS['fark_usd']: st.column_config.NumberColumn("Fark ($)", format="%.2f"),
                 COLS['tutar_usd']: st.column_config.NumberColumn("Tutar ($)", format="%.2f"),
+                COLS['kur']: st.column_config.NumberColumn("Kur", format="%.4f"),
             },
             num_rows="dynamic",
             use_container_width=True,
