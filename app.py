@@ -9,24 +9,15 @@ from datetime import datetime, timedelta
 import io
 
 # --- 1. AYARLAR VE YAPILANDIRMA ---
-# Hakkında metni
-about_text = """
-### Satış Yönetim Sistemi
-
-**Telif Hakkı 2025 Snowflake Inc.'e ait. Tüm haklar saklıdır.**
-**Telif hakkı Göksel Çapkın'a aittir.**
-"""
-
 st.set_page_config(
     page_title="Satış Yönetim Sistemi", 
     layout="wide", 
     page_icon="🏢",
     menu_items={
-        'About': about_text
+        'About': "### Satış Yönetim Sistemi\n\n**Geliştirici:** Göksel Çapkın\n\n**Telif Hakkı © 2025 Göksel Çapkın'a aittir.**"
     }
 )
 
-# Otomatik Config Düzeltici
 def fix_config():
     config_dir = ".streamlit"
     if not os.path.exists(config_dir): os.makedirs(config_dir)
@@ -35,8 +26,7 @@ def fix_config():
         with open(config_file, "w") as f:
             f.write("[server]\nenableCORS=false\nenableXsrfProtection=false\nmaxUploadSize=200\n[browser]\ngatherUsageStats=false")
 
-if fix_config():
-    st.toast("Ayarlar yapıldı. Lütfen yeniden başlatın.")
+fix_config()
 
 # Footer CSS
 hide_style = """
@@ -45,11 +35,11 @@ hide_style = """
 footer {visibility: hidden;}
 .footer {position: fixed; left: 0; bottom: 0; width: 100%; background-color: #f0f2f6; color: #31333F; text-align: center; padding: 10px; font-size: 12px; border-top: 1px solid #d2d2d2; z-index: 1000;}
 </style>
-<div class="footer"><p>Telif Hakkı 2025 Snowflake Inc.'e ait. Tüm haklar saklıdır. Telif hakkı Göksel Çapkın'a aittir.</p></div>
+<div class="footer"><p>Telif Hakkı © 2025 Göksel Çapkın'a aittir. Tüm haklar saklıdır.</p></div>
 """
 st.markdown(hide_style, unsafe_allow_html=True)
 
-# --- DOSYA İSİMLERİ ---
+# --- DOSYA VE SÜTUN İSİMLERİ ---
 SALES_FILE = "satis_verileri.csv"
 REF_FILE = "sistem_verileri.json"
 
@@ -70,29 +60,52 @@ COLS = {
     'tutar_tl': 'Tutar TL'
 }
 
-# --- YARDIMCI FONKSİYONLAR ---
-
+# --- GELİŞMİŞ TCMB KUR ÇEKME FONKSİYONU ---
 @st.cache_data(ttl=3600)
 def get_tcmb_rate(target_date):
+    """
+    TCMB'den USD Döviz Satış (ForexSelling) kurunu çeker.
+    Hafta sonu ve resmi tatilleri (verinin olmadığı günleri) atlayarak
+    en son geçerli iş gününün kurunu getirir.
+    """
     date_temp = target_date
-    for i in range(7):
-        if date_temp.weekday() >= 5: 
+    
+    # En fazla 10 gün geriye git (Sonsuz döngü koruması)
+    for _ in range(10):
+        # 1. Hafta sonu kontrolü (Cumartesi-Pazar ise Cuma'ya git)
+        while date_temp.weekday() >= 5:
             date_temp -= timedelta(days=1)
-            continue
-        day, month, year = date_temp.strftime("%d"), date_temp.strftime("%m"), date_temp.strftime("%Y")
+        
+        # URL Oluşturma
+        day = date_temp.strftime("%d")
+        month = date_temp.strftime("%m")
+        year = date_temp.strftime("%Y")
         url = f"https://www.tcmb.gov.tr/kurlar/{year}{month}/{day}{month}{year}.xml"
+        
         try:
-            res = requests.get(url, timeout=2)
+            res = requests.get(url, timeout=3)
+            
+            # Eğer sayfa varsa (200 OK)
             if res.status_code == 200:
                 root = ET.fromstring(res.content)
                 for currency in root.findall('Currency'):
+                    # USD KODLU PARAYI BUL
                     if currency.get('Kod') == 'USD':
-                        return float(currency.find('ForexSelling').text)
+                        # FOREX SELLING (Döviz Satış) Verisini Al
+                        val_str = currency.find('ForexSelling').text
+                        if val_str:
+                            return float(val_str)
+                return None # USD bulunamazsa
             else:
+                # Sayfa yoksa (404 vb.) -> Muhtemelen resmi tatil -> 1 gün geri git
                 date_temp -= timedelta(days=1)
-        except: return None
-    return None
+        except Exception as e:
+            # Bağlantı hatası vs. olursa da geri gitmeyi dene
+            date_temp -= timedelta(days=1)
+            
+    return 0.0 # 10 gün boyunca bulamazsa 0 dön
 
+# --- DİĞER YARDIMCI FONKSİYONLAR ---
 def load_system_data():
     if os.path.exists(REF_FILE):
         try: return json.load(open(REF_FILE, "r", encoding="utf-8"))
@@ -123,7 +136,7 @@ def convert_df_to_excel(df):
             df.to_excel(writer, index=False, sheet_name='Satis Listesi')
     return output.getvalue()
 
-def akilli_excel_import(uploaded_file):
+def akilli_excel_import_definitions(uploaded_file):
     logs = []
     data_found = {"bayiler": [], "musteriler": [], "urunler": [], "fabrikalar": []}
     try:
@@ -138,6 +151,31 @@ def akilli_excel_import(uploaded_file):
             elif "fabrika" in s_low: data_found["fabrikalar"].extend(col); logs.append(f"✅ Fabrikalar: {sheet}")
         return True, data_found, logs
     except Exception as e: return False, {}, [f"Hata: {str(e)}"]
+
+def import_sales_data(uploaded_file):
+    try:
+        df_new = pd.read_excel(uploaded_file)
+        
+        if COLS['tarih'] in df_new.columns:
+            df_new[COLS['tarih']] = pd.to_datetime(df_new[COLS['tarih']], errors='coerce')
+            df_new[COLS['gun']] = df_new[COLS['tarih']].apply(get_turkish_day)
+            df_new[COLS['ay']] = df_new[COLS['tarih']].dt.strftime('%Y-%m')
+        
+        numeric_cols = [COLS['mevcut_usd'], COLS['indirimli_usd'], COLS['tonaj'], COLS['kur']]
+        for col in numeric_cols:
+            if col in df_new.columns:
+                if df_new[col].dtype == object:
+                    df_new[col] = df_new[col].astype(str).str.replace(',', '.', regex=False)
+                df_new[col] = pd.to_numeric(df_new[col], errors='coerce').fillna(0)
+        
+        if COLS['mevcut_usd'] in df_new.columns and COLS['indirimli_usd'] in df_new.columns:
+             df_new[COLS['fark_usd']] = df_new[COLS['mevcut_usd']] - df_new[COLS['indirimli_usd']]
+             df_new[COLS['tutar_usd']] = df_new[COLS['fark_usd']] * df_new[COLS['tonaj']]
+             df_new[COLS['tutar_tl']] = df_new[COLS['tutar_usd']] * df_new[COLS['kur']]
+
+        return True, df_new, f"{len(df_new)} satır başarıyla okundu."
+    except Exception as e:
+        return False, None, str(e)
 
 # --- HESAPLAMA MOTORU ---
 def recalculate_dataframe(df):
@@ -174,42 +212,34 @@ sys_data = load_system_data()
 
 st.title("📊 Satış ve Hesaplama Sistemi")
 
-# --- SIDEBAR (KULLANIM KILAVUZU EKLENDİ) ---
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Veri Kurulumu")
-    uploaded_file = st.file_uploader("Excel Yükle (Listeleri Güncelle)", type=["xlsx"])
-    if uploaded_file and st.button("📥 Listeleri Sisteme Çek"):
-        success, new_data, logs = akilli_excel_import(uploaded_file)
-        if success:
-            sys_data["bayiler"] = clean_list(sys_data.get("bayiler", []) + new_data["bayiler"])
-            sys_data["musteriler"] = clean_list(sys_data["musteriler"] + new_data["musteriler"])
-            sys_data["urunler"] = clean_list(sys_data["urunler"] + new_data["urunler"])
-            if new_data["fabrikalar"]: sys_data["fabrikalar"] = clean_list(new_data["fabrikalar"])
-            save_system_data(sys_data)
-            st.success("Listeler güncellendi!")
-            st.rerun()
-
-    st.divider()
+    st.header("⚙️ Veri İşlemleri")
     
-    # KULLANIM KILAVUZU BÖLÜMÜ
-    with st.expander("📘 Kullanım Kılavuzu"):
-        st.markdown("""
-        **1. Başlangıç:**
-        - İlk kez kullanıyorsanız yukarıdaki 'Excel Yükle' alanından müşteri/ürün listenizi yükleyin.
-        
-        **2. Satış Girişi:**
-        - 'Satış Girişi' sekmesinden formu doldurun.
-        - TCMB Kuru otomatik çekilir.
-        - 'Kaydet' dediğinizde form temizlenir.
-        
-        **3. Düzenleme & Hesaplama:**
-        - Kayıtları değiştirmek için alttaki tabloyu kullanın.
-        - Değerleri değiştirdikten sonra **'Hesapla ve Güncelle'** butonuna MUTLAKA basın.
-        
-        **4. Raporlama:**
-        - 'Analiz Raporu' sekmesinden aylık döküm alın.
-        - 'Excel Olarak İndir' butonu ile raporu alın.
-        """)
+    with st.expander("📂 Tanımları Yükle (Müşteri/Ürün)"):
+        uploaded_def = st.file_uploader("Tanım Excel'i", type=["xlsx"], key="up_def")
+        if uploaded_def and st.button("📥 Listeleri Çek"):
+            success, new_data, logs = akilli_excel_import_definitions(uploaded_def)
+            if success:
+                sys_data["bayiler"] = clean_list(sys_data.get("bayiler", []) + new_data["bayiler"])
+                sys_data["musteriler"] = clean_list(sys_data["musteriler"] + new_data["musteriler"])
+                sys_data["urunler"] = clean_list(sys_data["urunler"] + new_data["urunler"])
+                if new_data["fabrikalar"]: sys_data["fabrikalar"] = clean_list(new_data["fabrikalar"])
+                save_system_data(sys_data)
+                st.success("Listeler güncellendi!")
+                st.rerun()
+
+    with st.expander("📥 Geçmiş Satışları Yükle"):
+        uploaded_sales = st.file_uploader("Satış Excel'i", type=["xlsx"], key="up_sales")
+        if uploaded_sales and st.button("🚀 Tabloya Aktar"):
+            success, new_df, msg = import_sales_data(uploaded_sales)
+            if success:
+                st.session_state.df_sales = pd.concat([st.session_state.df_sales, new_df], ignore_index=True)
+                st.session_state.df_sales.to_csv(SALES_FILE, index=False, encoding='utf-8-sig')
+                st.success(f"Başarılı! {msg}")
+                st.rerun()
+            else:
+                st.error(f"Hata: {msg}")
 
 # --- SEKMELER ---
 tabs = st.tabs(["📝 Satış Girişi & Düzenleme", "📈 Analiz Raporu", "🛠️ Tanımlamalar"])
@@ -231,7 +261,13 @@ with tabs[0]:
             ind_fiyat = st.number_input("İndirimli Fiyat USD", min_value=0.0, format="%.2f")
         with c3:
             tonaj = st.number_input("Tonaj KG", min_value=0.0, format="%.2f")
-            kur_default = get_tcmb_rate(datetime.now()) or 0.0
+            
+            # --- KUR HESAPLAMA KISMI ---
+            # Eğer tarih bugünse ve kur 0 geldiyse (ya da butonla tetiklendiyse) diye cache kullanıyoruz.
+            kur_default = get_tcmb_rate(tarih) 
+            # Eğer o gün için kur yoksa 0.0 gelir, kullanıcı elle girsin
+            if kur_default is None: kur_default = 0.0
+            
             kur_inp = st.number_input("TCMB Satış Kuru", value=kur_default, min_value=0.0, format="%.4f")
             
         btn_add = st.form_submit_button("💾 Kaydet")
@@ -265,7 +301,7 @@ with tabs[0]:
                 
                 st.session_state.df_sales = pd.concat([st.session_state.df_sales, pd.DataFrame([new_row])], ignore_index=True)
                 st.session_state.df_sales.to_csv(SALES_FILE, index=False, encoding='utf-8-sig')
-                st.success(f"✅ Kayıt Başarılı! ({musteri})")
+                st.success(f"✅ Kayıt Başarılı! Kur: {kur_inp}")
                 st.rerun()
 
     st.divider()
@@ -324,24 +360,43 @@ with tabs[0]:
             except Exception as e:
                 st.error(f"Hata: {e}")
     else:
-        st.info("Henüz veri girişi yapılmamış.")
+        st.info("Henüz veri girişi yapılmamış. Yandaki menüden Excel yükleyebilirsiniz.")
 
 # --- TAB 2: ANALİZ ---
 with tabs[1]:
     df = st.session_state.df_sales
     if not df.empty:
         st.subheader("📊 Performans Analizi")
+        
         all_months = sorted(df[COLS['ay']].astype(str).unique())
-        sel_months = st.multiselect("Dönem Seçimi:", all_months, default=all_months)
+        sel_months = st.multiselect("Dönem Seçimi (Ay/Yıl):", all_months, default=all_months)
         
         if sel_months:
             df_f = df[df[COLS['ay']].isin(sel_months)]
             
             k1, k2, k3 = st.columns(3)
-            k1.metric("Toplam Tonaj", f"{df_f[COLS['tonaj']].sum():,.0f} KG")
-            k2.metric("Toplam Tutar (USD)", f"${df_f[COLS['tutar_usd']].sum():,.2f}")
-            k3.metric("Toplam Tutar (TL)", f"₺{df_f[COLS['tutar_tl']].sum():,.2f}")
+            k1.metric("Seçilen Dönem Tonaj", f"{df_f[COLS['tonaj']].sum():,.0f} KG")
+            k2.metric("Seçilen Dönem Tutar (USD)", f"${df_f[COLS['tutar_usd']].sum():,.2f}")
+            k3.metric("Seçilen Dönem Tutar (TL)", f"₺{df_f[COLS['tutar_tl']].sum():,.2f}")
             
+            st.markdown("---")
+            
+            st.subheader("📅 Aylık Satış Özeti")
+            pivot_ay = df_f.groupby(COLS['ay']).agg({
+                COLS['tonaj']: 'sum',
+                COLS['tutar_usd']: 'sum',
+                COLS['tutar_tl']: 'sum'
+            }).reset_index().sort_values(by=COLS['ay'])
+            
+            st.dataframe(pivot_ay, use_container_width=True, column_config={
+                COLS['ay']: "Dönem",
+                COLS['tonaj']: st.column_config.NumberColumn("Toplam Tonaj", format="%.0f"),
+                COLS['tutar_usd']: st.column_config.NumberColumn("Toplam USD", format="$%.2f"),
+                COLS['tutar_tl']: st.column_config.NumberColumn("Toplam TL", format="₺%.2f"),
+            })
+            
+            st.divider()
+
             g1, g2 = st.columns(2)
             with g1:
                 st.caption("Bayi/Müşteri Bazlı Ciro ($)")
@@ -349,13 +404,12 @@ with tabs[1]:
                 st.plotly_chart(px.bar(grp_bayi, x=COLS['tutar_usd'], y=COLS['bayi'], orientation='h'), use_container_width=True)
             with g2:
                 st.caption("Aylık Trend (USD)")
-                grp_ay = df_f.groupby(COLS['ay'])[COLS['tutar_usd']].sum().reset_index()
-                st.plotly_chart(px.line(grp_ay, x=COLS['ay'], y=COLS['tutar_usd'], markers=True), use_container_width=True)
+                st.plotly_chart(px.line(pivot_ay, x=COLS['ay'], y=COLS['tutar_usd'], markers=True), use_container_width=True)
                 
             excel_data = convert_df_to_excel(df_f)
             if excel_data:
                 st.download_button(
-                    label="📥 Excel Olarak İndir (.xlsx)",
+                    label="📥 Seçilen Dönemi Excel İndir (.xlsx)",
                     data=excel_data,
                     file_name=f"Satis_Raporu_{datetime.now().strftime('%d-%m-%Y')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
