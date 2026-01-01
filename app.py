@@ -6,16 +6,17 @@ from datetime import datetime, timedelta
 import os
 import json
 import io
+import time
 import plotly.express as px
 
-# --- SAYFA AYARLARI ---
+# --- 1. SAYFA AYARLARI ---
 st.set_page_config(page_title="Satış Yönetim Sistemi", layout="wide", page_icon="🏢")
 
-# --- DOSYA AYARLARI ---
+# --- 2. SABİT AYARLAR ---
 SALES_FILE = "satis_verileri.csv"
 REF_FILE = "sistem_verileri.json"
 
-# SÜTUN İSİMLERİ (Yüklenen Excel ile Birebir Uyumlu)
+# Sütun İsimleri (Excelinizle Birebir Aynı)
 COLS = {
     'tarih': 'Tarih', 
     'gun': 'Gün', 
@@ -33,13 +34,15 @@ COLS = {
     'tutar_tl': 'Tutar TL'
 }
 
-# --- 1. TCMB KUR ÇEKME (GARANTİLİ) ---
+# --- 3. KRİTİK FONKSİYONLAR ---
+
 @st.cache_data(ttl=600)
 def get_tcmb_rate(target_date):
-    """Seçilen tarihe ait kuru getirir. Tatilse geriye gider."""
+    """Garantili Kur Çekme (Tatil Korumalı)"""
     date_temp = target_date
     for i in range(10):
-        if date_temp.weekday() >= 5: # Hafta sonu
+        # Hafta sonu atla
+        if date_temp.weekday() >= 5:
             date_temp -= timedelta(days=1)
             continue
             
@@ -63,55 +66,54 @@ def get_tcmb_rate(target_date):
             
     return 0.0, "Bulunamadı"
 
-# --- 2. VERİ YÖNETİMİ VE ONARIM ---
-def normalize_dataframe(df):
-    """Excel sütunlarını sisteme uygun hale getirir"""
-    # Eksik sütunları tamamla
-    for col_name in COLS.values():
-        if col_name not in df.columns:
-            # Sayısal alanlar için 0.0, metinler için boş string
-            if any(x in col_name for x in ['($)', 'TL', 'KG', 'Kuru']):
-                df[col_name] = 0.0
-            else:
-                df[col_name] = ""
-            
-    # Sadece gerekli sütunları al
-    df = df[list(COLS.values())]
+def clean_and_repair_data():
+    """Dosyayı okur, hatalı sütunları ve tipleri onarır"""
+    if not os.path.exists(SALES_FILE):
+        return pd.DataFrame(columns=list(COLS.values()))
     
-    # Sayısal Dönüşümler
-    numeric_cols = [
-        COLS['mevcut_usd'], COLS['indirimli_usd'], COLS['tonaj'], 
-        COLS['kur'], COLS['tutar_usd'], COLS['tutar_tl'], COLS['fark_usd']
-    ]
-    for c in numeric_cols:
-        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
-    
-    # TARİH DÜZELTME (HATA BURADA ÇÖZÜLÜYOR)
-    if COLS['tarih'] in df.columns:
-        df[COLS['tarih']] = pd.to_datetime(df[COLS['tarih']], errors='coerce')
-
-    return df
-
-def load_data():
-    # 1. Tanımlar
-    if not os.path.exists(REF_FILE):
-        sys_data = {"bayiler": [], "musteriler": [], "urunler": [], "fabrikalar": ["TR14", "TR15"]}
-        with open(REF_FILE, "w", encoding="utf-8") as f: json.dump(sys_data, f)
-    else:
-        with open(REF_FILE, "r", encoding="utf-8") as f: sys_data = json.load(f)
+    try:
+        df = pd.read_csv(SALES_FILE)
         
-    # 2. Satış Verileri
-    if 'df' not in st.session_state:
-        if os.path.exists(SALES_FILE):
-            try:
-                df_temp = pd.read_csv(SALES_FILE)
-                st.session_state.df = normalize_dataframe(df_temp)
-            except:
-                st.session_state.df = pd.DataFrame(columns=COLS.values())
-        else:
-            st.session_state.df = pd.DataFrame(columns=COLS.values())
+        # 1. Eksik sütunları ekle / Fazlalıkları at
+        # Mevcut veriyi koruyarak yeni şemaya uydur
+        df_new = pd.DataFrame(columns=list(COLS.values()))
+        for c in df_new.columns:
+            if c in df.columns:
+                df_new[c] = df[c]
+            else:
+                # Eski isimleri dene (Migration)
+                if c == 'Tutar ($)' and 'Tutar USD' in df.columns: df_new[c] = df['Tutar USD']
+                elif c == 'Mevcut ($)' and 'Mevcut Fiyat USD' in df.columns: df_new[c] = df['Mevcut Fiyat USD']
+                elif c == 'Tonaj KG' and 'Tonaj' in df.columns: df_new[c] = df['Tonaj']
+                else:
+                    df_new[c] = 0.0 if any(x in c for x in ['($)', 'TL', 'KG', 'Kuru']) else ""
+
+        # 2. Tarih Formatını Zorla (TypeError Çözümü)
+        df_new[COLS['tarih']] = pd.to_datetime(df_new[COLS['tarih']], errors='coerce')
+        # Geçersiz tarihleri (NaT) bugüne eşitle veya sil (Biz siliyoruz)
+        df_new = df_new.dropna(subset=[COLS['tarih']])
+        
+        # 3. Sayısal Formatları Zorla
+        num_cols = [COLS['mevcut_usd'], COLS['indirimli_usd'], COLS['tonaj'], 
+                    COLS['kur'], COLS['tutar_usd'], COLS['tutar_tl'], COLS['fark_usd']]
+        for c in num_cols:
+            df_new[c] = pd.to_numeric(df_new[c], errors='coerce').fillna(0.0)
             
-    return sys_data
+        return df_new
+    except Exception as e:
+        st.error(f"Veri dosyası bozuktu, sıfırlandı. Hata: {e}")
+        return pd.DataFrame(columns=list(COLS.values()))
+
+def save_data(df):
+    """Veriyi güvenli kaydeder"""
+    df.to_csv(SALES_FILE, index=False)
+
+def get_sys_data():
+    if not os.path.exists(REF_FILE):
+        default = {"bayiler": [], "musteriler": [], "urunler": [], "fabrikalar": ["TR14", "TR15"]}
+        with open(REF_FILE, "w", encoding="utf-8") as f: json.dump(default, f)
+        return default
+    with open(REF_FILE, "r", encoding="utf-8") as f: return json.load(f)
 
 def save_sys_data(data):
     with open(REF_FILE, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False)
@@ -121,234 +123,206 @@ def get_day_name(date_obj):
     days = {0: "Pazartesi", 1: "Salı", 2: "Çarşamba", 3: "Perşembe", 4: "Cuma", 5: "Cumartesi", 6: "Pazar"}
     return days.get(date_obj.weekday(), "")
 
-def to_excel_with_totals(df):
-    """Excel çıktısına TOPLAM satırı ekler"""
+def to_excel_export(df):
     output = io.BytesIO()
-    df_export = df.copy()
+    df_exp = df.copy()
+    df_exp[COLS['tarih']] = df_exp[COLS['tarih']].dt.strftime('%d.%m.%Y')
     
-    # Tarih formatı
-    df_export[COLS['tarih']] = df_export[COLS['tarih']].dt.strftime('%d.%m.%Y')
-    
-    # Toplam Satırı Oluştur
-    total_row = pd.DataFrame(columns=df_export.columns)
-    total_row.loc[0] = "" # Boş satır başlat
-    total_row.loc[0, COLS['mus']] = "GENEL TOPLAM" # Etiket
-    
-    # Toplanacak sütunlar
-    sum_cols = [COLS['tonaj'], COLS['tutar_usd'], COLS['tutar_tl']]
-    for c in sum_cols:
-        total_row.loc[0, c] = df_export[c].sum()
+    # Toplam Satırı
+    sum_row = pd.DataFrame(columns=df_exp.columns)
+    sum_row.loc[0] = ""
+    sum_row.loc[0, COLS['mus']] = "GENEL TOPLAM"
+    for c in [COLS['tonaj'], COLS['tutar_usd'], COLS['tutar_tl']]:
+        sum_row.loc[0, c] = df_exp[c].sum()
         
-    # Veriye ekle
-    df_final = pd.concat([df_export, total_row], ignore_index=True)
+    df_final = pd.concat([df_exp, sum_row], ignore_index=True)
     
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df_final.to_excel(writer, index=False, sheet_name='Satislar')
-        
-        # Formatlama (Opsiyonel: Toplam satırını kalın yapma)
-        workbook = writer.book
-        worksheet = writer.sheets['Satislar']
-        bold_fmt = workbook.add_format({'bold': True})
-        last_row = len(df_final)
-        worksheet.set_row(last_row, None, bold_fmt)
-        
     return output.getvalue()
 
-# --- 3. ANA UYGULAMA ---
-sys_data = load_data()
+# --- 4. ANA UYGULAMA AKIŞI ---
+sys_data = get_sys_data()
 st.title("📊 Satış Yönetim Sistemi")
 
-# --- SOL MENÜ ---
+# Sol Menü
 with st.sidebar:
-    st.header("⚙️ Veri Yükleme")
+    st.header("⚙️ Veri İşlemleri")
     with st.expander("📂 Tanımları Yükle"):
-        up_def = st.file_uploader("Tanım Excel", type="xlsx", key="def")
-        if up_def and st.button("Listeleri Güncelle"):
+        up_def = st.file_uploader("Tanım Excel", type="xlsx")
+        if up_def and st.button("Güncelle"):
             try:
                 xl = pd.ExcelFile(up_def)
                 for sheet in xl.sheet_names:
-                    df_tmp = pd.read_excel(xl, sheet)
-                    col = df_tmp.iloc[:, 0].dropna().astype(str).tolist()
-                    s_low = sheet.lower()
-                    if "bayi" in s_low: sys_data["bayiler"] += col
-                    elif "musteri" in s_low: sys_data["musteriler"] += col
-                    elif "urun" in s_low: sys_data["urunler"] += col
+                    df_t = pd.read_excel(xl, sheet)
+                    col = df_t.iloc[:, 0].dropna().astype(str).tolist()
+                    s = sheet.lower()
+                    if "bayi" in s: sys_data["bayiler"] += col
+                    elif "musteri" in s: sys_data["musteriler"] += col
+                    elif "urun" in s: sys_data["urunler"] += col
                 for k in sys_data: sys_data[k] = sorted(list(set(sys_data[k])))
                 save_sys_data(sys_data)
-                st.success("Tanımlar güncellendi!")
+                st.toast("Tanımlar güncellendi!", icon="✅")
+                time.sleep(1)
                 st.rerun()
-            except Exception as e:
-                st.error(f"Hata: {e}")
+            except: st.error("Dosya formatı hatalı.")
 
-# --- SEKMELER ---
+# Sekmeler
 tab1, tab2, tab3 = st.tabs(["📝 Satış Girişi", "📈 Raporlama", "🛠️ Tanımlar"])
 
-# --- TAB 1: SATIŞ GİRİŞİ ---
+# --- TAB 1: GİRİŞ ---
 with tab1:
-    c_date, c_kur_info = st.columns([1, 2])
+    c_date, c_inf = st.columns([1, 2])
     with c_date:
-        secilen_tarih = st.date_input("Tarih Seçiniz", datetime.now())
+        # Tarih seçimi (Date objesi döner)
+        sel_date = st.date_input("Tarih", datetime.now())
     
-    # Kuru Çek
-    kur_degeri, kur_tarihi = get_tcmb_rate(secilen_tarih)
-    
-    with c_kur_info:
-        if kur_degeri > 0:
-            st.success(f"✅ **{kur_tarihi}** tarihli Kur: **{kur_degeri:.4f}**")
-        else:
-            st.warning("⚠️ Kur bulunamadı.")
+    # Kur Çek
+    kur_val, kur_txt = get_tcmb_rate(sel_date)
+    with c_inf:
+        if kur_val > 0: st.success(f"**{kur_txt}** Kuru: **{kur_val:.4f}**")
+        else: st.warning("Kur bulunamadı (Manuel giriniz)")
 
-    with st.form("satis_form", clear_on_submit=True):
+    with st.form("entry", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         with c1:
             bayi = st.selectbox("Bayi", sys_data["bayiler"], index=None, placeholder="Seçiniz")
-            musteri = st.selectbox("Müşteri Adı", sys_data["musteriler"], index=None, placeholder="Seçiniz")
-            fabrika = st.selectbox("Fabrika", sys_data["fabrikalar"], index=None)
+            mus = st.selectbox("Müşteri", sys_data["musteriler"], index=None, placeholder="Seçiniz")
+            fab = st.selectbox("Fabrika", sys_data["fabrikalar"], index=None)
         with c2:
-            urun = st.selectbox("Ürün Adı", sys_data["urunler"], index=None, placeholder="Seçiniz")
-            f_mevcut = st.number_input("Mevcut Fiyat ($)", min_value=0.0, format="%.2f")
-            f_indirim = st.number_input("İndirimli Fiyat ($)", min_value=0.0, format="%.2f")
+            urun = st.selectbox("Ürün", sys_data["urunler"], index=None, placeholder="Seçiniz")
+            f_mevcut = st.number_input("Mevcut ($)", min_value=0.0, format="%.2f")
+            f_ind = st.number_input("İndirimli ($)", min_value=0.0, format="%.2f")
         with c3:
-            tonaj = st.number_input("Tonaj KG", min_value=0.0, format="%.0f")
-            kur_input = st.number_input("Kur (Otomatik)", value=kur_degeri, min_value=0.0, format="%.4f")
+            ton = st.number_input("Tonaj", min_value=0.0, format="%.0f")
+            kur = st.number_input("Kur", value=kur_val, min_value=0.0, format="%.4f")
             
-        kaydet = st.form_submit_button("💾 KAYDET")
-        
-        if kaydet:
-            if not musteri or not urun:
-                st.error("Müşteri ve Ürün seçmelisiniz!")
+        if st.form_submit_button("💾 KAYDET"):
+            if not mus or not urun:
+                st.error("Müşteri ve Ürün zorunludur!")
             else:
-                fark = f_mevcut - f_indirim
-                tutar_usd = fark * tonaj
-                tutar_tl = tutar_usd * kur_input
+                fark = f_mevcut - f_ind
+                t_usd = fark * ton
+                t_tl = t_usd * kur
                 
-                # --- TARİH FORMATI DÜZELTME (BURASI DEĞİŞTİ) ---
-                # secilen_tarih 'date' objesiydi, bunu pandas'ın anlayacağı 'timestamp' formatına çeviriyoruz.
-                tarih_ts = pd.to_datetime(secilen_tarih)
+                # Timestamp'e çevir (TypeError Çözümü)
+                ts_date = pd.to_datetime(sel_date)
                 
-                new_data = {
-                    COLS['tarih']: tarih_ts,
-                    COLS['gun']: get_day_name(secilen_tarih),
-                    COLS['ay']: secilen_tarih.strftime("%Y-%m"),
-                    COLS['bayi']: bayi, COLS['mus']: musteri, COLS['fab']: fabrika,
+                new_row = {
+                    COLS['tarih']: ts_date,
+                    COLS['gun']: get_day_name(sel_date),
+                    COLS['ay']: sel_date.strftime("%Y-%m"),
+                    COLS['bayi']: bayi, COLS['mus']: mus, COLS['fab']: fab,
                     COLS['urun']: urun, COLS['mevcut_usd']: f_mevcut,
-                    COLS['indirimli_usd']: f_indirim, COLS['fark_usd']: fark,
-                    COLS['tonaj']: tonaj, COLS['tutar_usd']: tutar_usd,
-                    COLS['kur']: kur_input, COLS['tutar_tl']: tutar_tl
+                    COLS['indirimli_usd']: f_ind, COLS['fark_usd']: fark,
+                    COLS['tonaj']: ton, COLS['tutar_usd']: t_usd,
+                    COLS['kur']: kur, COLS['tutar_tl']: t_tl
                 }
                 
-                st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_data])], ignore_index=True)
-                st.session_state.df.to_csv(SALES_FILE, index=False)
-                st.success("Kayıt Eklendi!")
+                df_curr = clean_and_repair_data()
+                df_curr = pd.concat([df_curr, pd.DataFrame([new_row])], ignore_index=True)
+                save_data(df_curr)
+                st.toast("Kayıt Başarılı!", icon="✅")
+                time.sleep(0.5)
                 st.rerun()
 
-    # --- TABLO DÜZENLEME ---
     st.divider()
-    st.subheader("📋 Kayıt Listesi & Düzenleme")
     
-    if not st.session_state.df.empty:
-        # Canlı Toplamları Göster
-        t_ton = st.session_state.df[COLS['tonaj']].sum()
-        t_usd = st.session_state.df[COLS['tutar_usd']].sum()
-        t_tl = st.session_state.df[COLS['tutar_tl']].sum()
+    # Tablo Gösterimi
+    df = clean_and_repair_data()
+    if not df.empty:
+        # Canlı Toplamlar
+        t_ton = df[COLS['tonaj']].sum()
+        t_usd = df[COLS['tutar_usd']].sum()
+        t_tl = df[COLS['tutar_tl']].sum()
         
         m1, m2, m3 = st.columns(3)
-        m1.metric("TOPLAM Tonaj", f"{t_ton:,.0f} KG")
+        m1.metric("TOPLAM Tonaj", f"{t_ton:,.0f}")
         m2.metric("TOPLAM Tutar ($)", f"${t_usd:,.2f}")
         m3.metric("TOPLAM Tutar (TL)", f"₺{t_tl:,.2f}")
         
-        # --- SIRALAMA HATASI İÇİN GÜVENLİK ÖNLEMİ ---
-        # Sıralama yapmadan önce Tarih sütununu kesinlikle datetime formatına zorluyoruz.
-        st.session_state.df[COLS['tarih']] = pd.to_datetime(st.session_state.df[COLS['tarih']], errors='coerce')
+        # Sıralama (Güvenli)
+        df = df.sort_values(by=COLS['tarih'], ascending=True)
         
-        # Eskiden Yeniye (ascending=True)
-        df_sorted = st.session_state.df.sort_values(by=COLS['tarih'], ascending=True)
+        st.subheader("📋 Kayıt Listesi")
+        edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
         
-        edited_df = st.data_editor(df_sorted, num_rows="dynamic", use_container_width=True)
-        
-        if st.button("🔄 Tabloyu Güncelle ve Hesapla"):
-            edited_df = normalize_dataframe(edited_df)
+        if st.button("🔄 Tabloyu Güncelle"):
+            # Güvenli Hesaplama (Row by Row to avoid KeyErrors during edit)
             for idx, row in edited_df.iterrows():
                 try:
-                    m_fiyat = float(row[COLS['mevcut_usd']])
-                    i_fiyat = float(row[COLS['indirimli_usd']])
-                    ton = float(row[COLS['tonaj']])
-                    kur = float(row[COLS['kur']])
+                    f = row[COLS['mevcut_usd']] - row[COLS['indirimli_usd']]
+                    tu = f * row[COLS['tonaj']]
+                    ttl = tu * row[COLS['kur']]
                     
-                    fark = m_fiyat - i_fiyat
-                    t_usd = fark * ton
-                    t_tl = t_usd * kur
-                    
-                    edited_df.at[idx, COLS['fark_usd']] = fark
-                    edited_df.at[idx, COLS['tutar_usd']] = t_usd
-                    edited_df.at[idx, COLS['tutar_tl']] = t_tl
+                    edited_df.at[idx, COLS['fark_usd']] = f
+                    edited_df.at[idx, COLS['tutar_usd']] = tu
+                    edited_df.at[idx, COLS['tutar_tl']] = ttl
                     
                     d = pd.to_datetime(row[COLS['tarih']])
                     edited_df.at[idx, COLS['gun']] = get_day_name(d)
                     edited_df.at[idx, COLS['ay']] = d.strftime("%Y-%m")
                 except: pass
-
-            st.session_state.df = edited_df
-            st.session_state.df.to_csv(SALES_FILE, index=False)
-            st.success("Güncellendi!")
+            
+            save_data(edited_df)
+            st.toast("Güncellendi!", icon="🔄")
+            time.sleep(0.5)
             st.rerun()
 
-# --- TAB 2: RAPORLAMA ---
+# --- TAB 2: RAPOR ---
 with tab2:
-    df = st.session_state.df
+    df = clean_and_repair_data()
     if df.empty:
         st.info("Veri yok.")
     else:
-        # Filtreleme
         aylar = sorted(df[COLS['ay']].astype(str).unique())
-        secilen_ay = st.multiselect("Ay Seçiniz", aylar, default=aylar)
-        
-        df_filt = df if not secilen_ay else df[df[COLS['ay']].isin(secilen_ay)]
+        sel_ay = st.multiselect("Ay Seçiniz", aylar, default=aylar)
+        df_f = df if not sel_ay else df[df[COLS['ay']].isin(sel_ay)]
         
         c1, c2, c3 = st.columns(3)
-        c1.metric("Toplam Tonaj", f"{df_filt[COLS['tonaj']].sum():,.0f}")
-        c2.metric("Toplam USD", f"${df_filt[COLS['tutar_usd']].sum():,.2f}")
-        c3.metric("Toplam TL", f"₺{df_filt[COLS['tutar_tl']].sum():,.2f}")
+        c1.metric("Seçilen Tonaj", f"{df_f[COLS['tonaj']].sum():,.0f}")
+        c2.metric("Seçilen USD", f"${df_f[COLS['tutar_usd']].sum():,.2f}")
+        c3.metric("Seçilen TL", f"₺{df_f[COLS['tutar_tl']].sum():,.2f}")
         
         st.divider()
-        
-        if COLS['mus'] in df_filt.columns:
-            pivot = df_filt.groupby(COLS['mus']).agg({
-                COLS['tonaj']: 'sum',
-                COLS['tutar_usd']: 'sum'
+        if not df_f.empty:
+            piv = df_f.groupby(COLS['mus']).agg({
+                COLS['tonaj']: 'sum', COLS['tutar_usd']: 'sum'
             }).reset_index().sort_values(by=COLS['tutar_usd'], ascending=False)
             
-            c_chart, c_table = st.columns([2, 1])
-            with c_chart:
-                fig = px.bar(pivot.head(10), x=COLS['mus'], y=COLS['tutar_usd'], title="Top 10 Müşteri")
+            c_ch, c_tb = st.columns([2, 1])
+            with c_ch:
+                fig = px.bar(piv.head(10), x=COLS['mus'], y=COLS['tutar_usd'], title="Top 10 Müşteri")
                 st.plotly_chart(fig, use_container_width=True)
-            with c_table:
-                st.dataframe(pivot, hide_index=True, use_container_width=True)
+            with c_tb:
+                st.dataframe(piv, hide_index=True, use_container_width=True)
         
-        st.download_button("📥 Excel İndir (Toplamlı)", data=to_excel_with_totals(df_filt), file_name="Satis_Raporu.xlsx")
+        st.download_button("📥 Excel İndir", data=to_excel_export(df_f), file_name="Rapor.xlsx")
 
 # --- TAB 3: TANIMLAR ---
 with tab3:
     c1, c2, c3 = st.columns(3)
-    def manage(title, key):
-        st.subheader(title)
-        val = st.text_input(f"Yeni {title}", key=f"n_{key}")
-        if st.button(f"Ekle {title}"):
-            if val and val not in sys_data[key]:
-                sys_data[key].append(val)
+    def man(t, k):
+        st.subheader(t)
+        v = st.text_input(f"Yeni", key=f"n_{k}")
+        if st.button(f"Ekle {t}"):
+            if v and v not in sys_data[k]:
+                sys_data[k].append(v)
                 save_sys_data(sys_data)
                 st.rerun()
-        d_val = st.selectbox(f"Sil {title}", sys_data[key], key=f"d_{key}")
-        if st.button(f"Sil {title}"):
-            sys_data[key].remove(d_val)
+        d = st.selectbox(f"Sil", sys_data[k], key=f"d_{k}")
+        if st.button(f"Sil {t}"):
+            sys_data[k].remove(d)
             save_sys_data(sys_data)
             st.rerun()
 
-    with c1: manage("Bayi", "bayiler")
-    with c2: manage("Müşteri", "musteriler")
-    with c3: manage("Ürün", "urunler")
+    with c1: man("Bayi", "bayiler")
+    with c2: man("Müşteri", "musteriler")
+    with c3: man("Ürün", "urunler")
     
-    if st.button("🔥 VERİTABANINI SIFIRLA"):
+    st.divider()
+    if st.button("🔥 SIFIRLA"):
         if os.path.exists(SALES_FILE): os.remove(SALES_FILE)
-        st.session_state.df = pd.DataFrame(columns=COLS.values())
+        st.toast("Sıfırlandı!", icon="⚠️")
+        time.sleep(1)
         st.rerun()
